@@ -14,7 +14,7 @@ import os
 import re
 from functools import lru_cache
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import spotipy
 from fastapi import FastAPI, HTTPException, status
@@ -36,7 +36,7 @@ WORKER_FUNCTION_PATH = "worker.process_track"
 
 app = FastAPI(
     title="ClipFX Spotify Producer API",
-    version="1.1.2",
+    version="1.1.3",
     description="Lightweight Spotify metadata API and RQ producer for ClipFX downloads.",
 )
 
@@ -82,8 +82,33 @@ class DownloadResponse(BaseModel):
     message: str = "Job queued. Poll the worker/status service until the file is ready."
 
 
+def normalize_redis_url(redis_url: str) -> str:
+    """Normalize Redis URLs for Upstash.
+
+    Upstash requires TLS. If Render is given an Upstash URL with redis:// by
+    mistake, redis-py will open a plain TCP connection and Upstash closes the
+    socket during the handshake. That shows up as `Connection closed by server`.
+    """
+
+    clean_url = str(redis_url or "").strip()
+    if not clean_url:
+        return ""
+
+    try:
+        parsed = urlparse(clean_url)
+    except Exception:
+        return clean_url
+
+    hostname = (parsed.hostname or "").lower()
+    is_upstash = "upstash" in hostname
+    if parsed.scheme.lower() == "redis" and is_upstash:
+        return urlunparse(parsed._replace(scheme="rediss"))
+
+    return clean_url
+
+
 def get_redis_url() -> str:
-    redis_url = os.getenv("REDIS_URL", "").strip()
+    redis_url = normalize_redis_url(os.getenv("REDIS_URL", ""))
     if not redis_url:
         raise RuntimeError("REDIS_URL is not configured.")
     return redis_url
@@ -93,20 +118,26 @@ def build_redis_connection() -> Redis:
     """Create a fresh Upstash Redis connection.
 
     Render web instances can sit idle, and Upstash may close idle connections.
-    Creating the RQ connection close to enqueue time plus retrying once prevents
-    stale cached sockets from causing `Connection closed by server` failures.
+    Creating the RQ connection close to enqueue time plus retrying prevents stale
+    cached sockets from causing `Connection closed by server` failures.
     """
 
     redis_url = get_redis_url()
     connection_options: dict[str, Any] = {
-        "socket_connect_timeout": 5,
-        "socket_timeout": 30,
+        "socket_connect_timeout": int(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "10")),
+        "socket_timeout": int(os.getenv("REDIS_SOCKET_TIMEOUT", "30")),
         "retry_on_timeout": True,
-        "health_check_interval": 30,
+        "health_check_interval": int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL", "30")),
+        "socket_keepalive": True,
     }
 
     if redis_url.lower().startswith("rediss://"):
-        connection_options["ssl_cert_reqs"] = None
+        connection_options.update(
+            {
+                "ssl_cert_reqs": None,
+                "ssl_check_hostname": False,
+            }
+        )
 
     return Redis.from_url(redis_url, **connection_options)
 
@@ -122,14 +153,16 @@ def close_redis_connection(connection: Redis | None) -> None:
         return
     try:
         connection.close()
+        connection.connection_pool.disconnect()
     except Exception:
         pass
 
 
 def enqueue_download_job(youtube_url: str, spotify_id: str, track_name: str, artist_name: str):
     last_error: Exception | None = None
+    attempts = max(1, int(os.getenv("REDIS_ENQUEUE_ATTEMPTS", "3")))
 
-    for attempt in range(2):
+    for attempt in range(attempts):
         connection: Redis | None = None
         try:
             connection = build_redis_connection()
