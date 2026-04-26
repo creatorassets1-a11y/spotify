@@ -36,7 +36,7 @@ WORKER_FUNCTION_PATH = "worker.process_track"
 
 app = FastAPI(
     title="ClipFX Spotify Producer API",
-    version="1.1.0",
+    version="1.1.1",
     description="Lightweight Spotify metadata API and RQ producer for ClipFX downloads.",
 )
 
@@ -84,19 +84,27 @@ class DownloadResponse(BaseModel):
 
 @lru_cache(maxsize=1)
 def get_redis_connection() -> Redis:
-    """Return a cached Redis connection using REDIS_URL."""
+    """Return a cached Upstash Redis connection using REDIS_URL.
+
+    Upstash usually requires rediss://. The extra timeout, retry, and health check
+    settings keep Render/RQ connections from failing after idle periods.
+    """
 
     redis_url = os.getenv("REDIS_URL", "").strip()
     if not redis_url:
         raise RuntimeError("REDIS_URL is not configured.")
 
-    return Redis.from_url(
-        redis_url,
-        socket_connect_timeout=8,
-        socket_timeout=30,
-        retry_on_timeout=True,
-        health_check_interval=30,
-    )
+    connection_options: dict[str, Any] = {
+        "socket_connect_timeout": 5,
+        "socket_timeout": 30,
+        "retry_on_timeout": True,
+        "health_check_interval": 30,
+    }
+
+    if redis_url.lower().startswith("rediss://"):
+        connection_options["ssl_cert_reqs"] = None
+
+    return Redis.from_url(redis_url, **connection_options)
 
 
 @lru_cache(maxsize=1)
