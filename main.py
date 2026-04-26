@@ -36,7 +36,7 @@ WORKER_FUNCTION_PATH = "worker.process_track"
 
 app = FastAPI(
     title="ClipFX Spotify Producer API",
-    version="1.1.1",
+    version="1.1.2",
     description="Lightweight Spotify metadata API and RQ producer for ClipFX downloads.",
 )
 
@@ -82,18 +82,22 @@ class DownloadResponse(BaseModel):
     message: str = "Job queued. Poll the worker/status service until the file is ready."
 
 
-@lru_cache(maxsize=1)
-def get_redis_connection() -> Redis:
-    """Return a cached Upstash Redis connection using REDIS_URL.
-
-    Upstash usually requires rediss://. The extra timeout, retry, and health check
-    settings keep Render/RQ connections from failing after idle periods.
-    """
-
+def get_redis_url() -> str:
     redis_url = os.getenv("REDIS_URL", "").strip()
     if not redis_url:
         raise RuntimeError("REDIS_URL is not configured.")
+    return redis_url
 
+
+def build_redis_connection() -> Redis:
+    """Create a fresh Upstash Redis connection.
+
+    Render web instances can sit idle, and Upstash may close idle connections.
+    Creating the RQ connection close to enqueue time plus retrying once prevents
+    stale cached sockets from causing `Connection closed by server` failures.
+    """
+
+    redis_url = get_redis_url()
     connection_options: dict[str, Any] = {
         "socket_connect_timeout": 5,
         "socket_timeout": 30,
@@ -107,11 +111,52 @@ def get_redis_connection() -> Redis:
     return Redis.from_url(redis_url, **connection_options)
 
 
-@lru_cache(maxsize=1)
-def get_download_queue() -> Queue:
+def get_download_queue(connection: Redis | None = None) -> Queue:
     """Return the RQ queue used by the DigitalOcean worker."""
 
-    return Queue(QUEUE_NAME, connection=get_redis_connection())
+    return Queue(QUEUE_NAME, connection=connection or build_redis_connection())
+
+
+def close_redis_connection(connection: Redis | None) -> None:
+    if not connection:
+        return
+    try:
+        connection.close()
+    except Exception:
+        pass
+
+
+def enqueue_download_job(youtube_url: str, spotify_id: str, track_name: str, artist_name: str):
+    last_error: Exception | None = None
+
+    for attempt in range(2):
+        connection: Redis | None = None
+        try:
+            connection = build_redis_connection()
+            connection.ping()
+            queue = get_download_queue(connection)
+            return queue.enqueue(
+                WORKER_FUNCTION_PATH,
+                youtube_url,
+                spotify_id,
+                job_timeout="30m",
+                result_ttl=24 * 60 * 60,
+                failure_ttl=7 * 24 * 60 * 60,
+                meta={
+                    "spotify_id": spotify_id,
+                    "track_name": track_name,
+                    "artist_name": artist_name,
+                    "youtube_url": youtube_url,
+                    "source": "clipfx-render-fastapi-producer",
+                    "enqueue_attempt": attempt + 1,
+                },
+            )
+        except (RedisError, RuntimeError) as exc:
+            last_error = exc
+            close_redis_connection(connection)
+            continue
+
+    raise RuntimeError(f"Could not connect to Redis or enqueue the job: {last_error}")
 
 
 @lru_cache(maxsize=1)
@@ -248,13 +293,17 @@ def root() -> dict[str, str]:
 def health() -> dict[str, str]:
     """Render health check endpoint."""
 
+    connection: Redis | None = None
     try:
-        get_redis_connection().ping()
+        connection = build_redis_connection()
+        connection.ping()
     except (RedisError, RuntimeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Redis is unavailable: {exc}",
         ) from exc
+    finally:
+        close_redis_connection(connection)
 
     return {"status": "ok", "redis": "connected"}
 
@@ -296,22 +345,7 @@ def queue_download(payload: DownloadRequest) -> DownloadResponse:
     youtube_url = find_best_youtube_url(track_name, artist_name)
 
     try:
-        queue = get_download_queue()
-        job = queue.enqueue(
-            WORKER_FUNCTION_PATH,
-            youtube_url,
-            spotify_id,
-            job_timeout="30m",
-            result_ttl=24 * 60 * 60,
-            failure_ttl=7 * 24 * 60 * 60,
-            meta={
-                "spotify_id": spotify_id,
-                "track_name": track_name,
-                "artist_name": artist_name,
-                "youtube_url": youtube_url,
-                "source": "clipfx-render-fastapi-producer",
-            },
-        )
+        job = enqueue_download_job(youtube_url, spotify_id, track_name, artist_name)
     except (RedisError, RuntimeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
