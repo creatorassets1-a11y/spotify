@@ -2,6 +2,7 @@
 
 This Render-hosted FastAPI app stays intentionally light:
 - It searches Spotify metadata.
+- It accepts legacy ClipFX spotify_url download requests.
 - It finds a likely YouTube URL for a selected track.
 - It enqueues a remote RQ job into Upstash Redis.
 
@@ -10,12 +11,14 @@ The DigitalOcean worker must listen to the `downloads` queue and expose:
 """
 
 import os
+import re
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlparse
 
 import spotipy
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl, model_validator
 from redis import Redis, RedisError
 from rq import Queue
 from spotipy.oauth2 import SpotifyClientCredentials
@@ -33,7 +36,7 @@ WORKER_FUNCTION_PATH = "worker.process_track"
 
 app = FastAPI(
     title="ClipFX Spotify Producer API",
-    version="1.0.0",
+    version="1.1.0",
     description="Lightweight Spotify metadata API and RQ producer for ClipFX downloads.",
 )
 
@@ -49,9 +52,23 @@ class SearchResponseTrack(BaseModel):
 
 
 class DownloadRequest(BaseModel):
-    spotify_id: str = Field(..., min_length=1, max_length=160)
-    track_name: str = Field(..., min_length=1, max_length=300)
-    artist_name: str = Field(..., min_length=1, max_length=300)
+    # New producer contract
+    spotify_id: str | None = Field(default=None, min_length=1, max_length=160)
+    track_name: str | None = Field(default=None, min_length=1, max_length=300)
+    artist_name: str | None = Field(default=None, min_length=1, max_length=300)
+
+    # Legacy ClipFX backend contract
+    spotify_url: HttpUrl | None = None
+    url: HttpUrl | None = None
+    spotifyUrl: HttpUrl | None = None
+    track_url: HttpUrl | None = None
+    trackUrl: HttpUrl | None = None
+
+    @model_validator(mode="after")
+    def require_identifier_or_url(self) -> "DownloadRequest":
+        if self.spotify_id or self.spotify_url or self.url or self.spotifyUrl or self.track_url or self.trackUrl:
+            return self
+        raise ValueError("Provide either spotify_id plus track metadata, or spotify_url.")
 
 
 class DownloadResponse(BaseModel):
@@ -60,6 +77,9 @@ class DownloadResponse(BaseModel):
     queue: str = QUEUE_NAME
     spotify_id: str
     youtube_url: str
+    track_name: str | None = None
+    artist_name: str | None = None
+    message: str = "Job queued. Poll the worker/status service until the file is ready."
 
 
 @lru_cache(maxsize=1)
@@ -120,6 +140,75 @@ def normalize_spotify_track(item: dict[str, Any]) -> SearchResponseTrack:
         image_url=image_url,
         spotify_url=item.get("external_urls", {}).get("spotify"),
     )
+
+
+def get_payload_spotify_url(payload: DownloadRequest) -> str:
+    for value in [payload.spotify_url, payload.url, payload.spotifyUrl, payload.track_url, payload.trackUrl]:
+        if value:
+            return str(value)
+    return ""
+
+
+def extract_spotify_track_id(value: str) -> str:
+    clean_value = str(value or "").strip()
+    if not clean_value:
+        return ""
+
+    if re.fullmatch(r"[A-Za-z0-9]{10,40}", clean_value):
+        return clean_value
+
+    spotify_uri_match = re.search(r"spotify:track:([A-Za-z0-9]+)", clean_value, re.IGNORECASE)
+    if spotify_uri_match:
+        return spotify_uri_match.group(1)
+
+    try:
+        parsed = urlparse(clean_value)
+        parts = [part for part in parsed.path.split("/") if part]
+        if "track" in parts:
+            index = parts.index("track")
+            if index + 1 < len(parts):
+                return parts[index + 1]
+    except Exception:
+        pass
+
+    return ""
+
+
+def get_track_metadata_from_spotify_id(spotify_id: str) -> tuple[str, str]:
+    try:
+        track = get_spotify_client().track(spotify_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Spotify metadata lookup failed.") from exc
+
+    track_name = str(track.get("name") or "").strip()
+    artists = [artist.get("name", "") for artist in track.get("artists", []) if artist.get("name")]
+    artist_name = artists[0] if artists else ""
+
+    if not track_name or not artist_name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Spotify track metadata is incomplete.")
+
+    return track_name, artist_name
+
+
+def resolve_download_payload(payload: DownloadRequest) -> tuple[str, str, str]:
+    spotify_id = str(payload.spotify_id or "").strip()
+    spotify_url = get_payload_spotify_url(payload)
+
+    if not spotify_id and spotify_url:
+        spotify_id = extract_spotify_track_id(spotify_url)
+
+    if not spotify_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A valid Spotify track ID or Spotify track URL is required.")
+
+    track_name = str(payload.track_name or "").strip()
+    artist_name = str(payload.artist_name or "").strip()
+
+    if not track_name or not artist_name:
+        track_name, artist_name = get_track_metadata_from_spotify_id(spotify_id)
+
+    return spotify_id, track_name, artist_name
 
 
 def find_best_youtube_url(track_name: str, artist_name: str) -> str:
@@ -189,27 +278,28 @@ def search_tracks(query: str, limit: int = 10) -> list[SearchResponseTrack]:
 
 @app.post("/download", response_model=DownloadResponse, status_code=status.HTTP_202_ACCEPTED)
 def queue_download(payload: DownloadRequest) -> DownloadResponse:
-    """Find a YouTube source and enqueue the processing task.
+    """Accept old ClipFX spotify_url requests and new metadata requests.
 
     This endpoint does not process audio. It only produces a job for the remote
     DigitalOcean worker through Upstash Redis/RQ.
     """
 
-    youtube_url = find_best_youtube_url(payload.track_name, payload.artist_name)
+    spotify_id, track_name, artist_name = resolve_download_payload(payload)
+    youtube_url = find_best_youtube_url(track_name, artist_name)
 
     try:
         queue = get_download_queue()
         job = queue.enqueue(
             WORKER_FUNCTION_PATH,
             youtube_url,
-            payload.spotify_id,
+            spotify_id,
             job_timeout="30m",
             result_ttl=24 * 60 * 60,
             failure_ttl=7 * 24 * 60 * 60,
             meta={
-                "spotify_id": payload.spotify_id,
-                "track_name": payload.track_name,
-                "artist_name": payload.artist_name,
+                "spotify_id": spotify_id,
+                "track_name": track_name,
+                "artist_name": artist_name,
                 "youtube_url": youtube_url,
                 "source": "clipfx-render-fastapi-producer",
             },
@@ -227,6 +317,8 @@ def queue_download(payload: DownloadRequest) -> DownloadResponse:
 
     return DownloadResponse(
         job_id=job.id,
-        spotify_id=payload.spotify_id,
+        spotify_id=spotify_id,
         youtube_url=youtube_url,
+        track_name=track_name,
+        artist_name=artist_name,
     )
