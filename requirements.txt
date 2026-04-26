@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+redis
+rq
+spotipy
+python-dotenv
