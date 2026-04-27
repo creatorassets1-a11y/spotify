@@ -15,6 +15,7 @@ matching ClipFX music_tracks rows as ready in Postgres.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import mimetypes
 import os
@@ -219,6 +220,10 @@ def _upload_to_r2(audio_file: Path, spotify_id: str, filename: str) -> tuple[str
     return _download_url_for_key(client, key, filename, media_type), key
 
 
+def _metadata(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, separators=(",", ":"))
+
+
 def _mark_processing(spotify_id: str, youtube_url: str) -> None:
     with _db_connect() as conn, conn.cursor() as cur:
         cur.execute(
@@ -230,7 +235,7 @@ def _mark_processing(spotify_id: str, youtube_url: str) -> None:
                    updated_at = now()
              WHERE spotify_track_id = %s
             """,
-            [f'{ {"worker_started": True, "youtube_url": youtube_url} }'.replace("'", '"'), spotify_id],
+            [_metadata({"worker_started": True, "youtube_url": youtube_url}), spotify_id],
         )
 
 
@@ -247,7 +252,7 @@ def _mark_ready(spotify_id: str, download_url: str, filename: str, r2_key: str) 
                    updated_at = now()
              WHERE spotify_track_id = %s
             """,
-            [download_url, filename, f'{ {"r2_key": r2_key, "worker_completed": True} }'.replace("'", '"'), spotify_id],
+            [download_url, filename, _metadata({"r2_key": r2_key, "worker_completed": True}), spotify_id],
         )
 
 
@@ -263,7 +268,7 @@ def _mark_failed(spotify_id: str, error: Exception) -> None:
                    updated_at = now()
              WHERE spotify_track_id = %s
             """,
-            [message, f'{ {"worker_failed": True} }'.replace("'", '"'), spotify_id],
+            [message, _metadata({"worker_failed": True}), spotify_id],
         )
 
 
