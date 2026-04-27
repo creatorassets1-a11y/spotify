@@ -1,6 +1,10 @@
-fastapi
-uvicorn[standard]
-redis
-rq
-spotipy
-python-dotenv
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+spotipy==2.24.0
+redis==5.2.1
+rq==2.1.0
+pydantic==2.10.4
+python-dotenv==1.0.1
+yt-dlp==2026.4.22
+boto3==1.35.92
+psycopg2-binary==2.9.10
