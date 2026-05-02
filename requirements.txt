@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
 redis
-rq
+rq==1.16.2
 spotipy
 python-dotenv
